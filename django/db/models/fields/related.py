@@ -236,7 +236,13 @@ class SingleRelatedObjectDescriptor(object):
         db = router.db_for_read(self.related.model, **db_hints)
         return self.related.model._base_manager.using(db)
 
-    def get_prefetch_query_set(self, instances):
+    def get_prefetch_query_set(self, instances, custom_qs=None):
+        if custom_qs is not None:
+            # TODO: This error message is too SQLish, and might be downright
+            # wrong.
+            raise ValueError(
+                "Custom querysets can't be used for one-to-one relations")
+
         vals = set(instance._get_pk_val() for instance in instances)
         params = {'%s__pk__in' % self.related.field.name: vals}
         return (self.get_query_set(instance=instances[0]).filter(**params),
@@ -315,7 +321,13 @@ class ReverseSingleRelatedObjectDescriptor(object):
         else:
             return QuerySet(self.field.rel.to).using(db)
 
-    def get_prefetch_query_set(self, instances):
+    def get_prefetch_query_set(self, instances, custom_qs=None):
+        if custom_qs is not None:
+            # TODO: This error message is too SQLish, and I am not even sure
+            # this desriptor is used for m2o...
+            raise ValueError(
+                "Custom querysets can't be used for many-to-one relations")
+
         vals = set(getattr(instance, self.field.attname) for instance in instances)
         other_field = self.field.rel.get_related_field()
         if other_field.rel:
@@ -460,16 +472,30 @@ class ForeignRelatedObjectsDescriptor(object):
                     db = self._db or router.db_for_read(self.model, instance=self.instance)
                     return super(RelatedManager, self).get_query_set().using(db).filter(**self.core_filters)
 
-            def get_prefetch_query_set(self, instances):
-                db = self._db or router.db_for_read(self.model, instance=instances[0])
+            def get_prefetch_query_set(self, instances, custom_qs=None):
+                """
+                Return a queryset that does the bulk lookup needed
+                by prefetch_related functionality.
+                """
                 query = {'%s__%s__in' % (rel_field.name, attname):
-                             set(getattr(obj, attname) for obj in instances)}
-                qs = super(RelatedManager, self).get_query_set().using(db).filter(**query)
+                            set(getattr(obj, attname) for obj in instances)}
+                if custom_qs is not None:
+                    qs = custom_qs.filter(**query)
+                else:
+                    db = self._db or router.db_for_read(self.model, instance=instances[0])
+                    qs = super(RelatedManager, self).get_query_set().\
+                                    using(db).filter(**query)
                 return (qs,
                         attrgetter(rel_field.get_attname()),
                         attrgetter(attname),
                         False,
                         rel_field.related_query_name())
+
+            def all(self):
+                try:
+                    return self.instance._prefetched_objects_cache[rel_field.related_query_name()]
+                except (AttributeError, KeyError):
+                    return super(RelatedManager, self).all()
 
             def add(self, *objs):
                 for obj in objs:
@@ -542,25 +568,40 @@ def create_many_related_manager(superclass, rel):
                 db = self._db or router.db_for_read(self.instance.__class__, instance=self.instance)
                 return super(ManyRelatedManager, self).get_query_set().using(db)._next_is_sticky().filter(**self.core_filters)
 
-        def get_prefetch_query_set(self, instances):
+        def get_prefetch_query_set(self, instances, custom_qs=None):
             instance = instances[0]
             from django.db import connections
             db = self._db or router.db_for_read(instance.__class__, instance=instance)
             query = {'%s__pk__in' % self.query_field_name:
                          set(obj._get_pk_val() for obj in instances)}
-            qs = super(ManyRelatedManager, self).get_query_set().using(db)._next_is_sticky().filter(**query)
+
+            if custom_qs is not None:
+                qs = custom_qs._next_is_sticky().filter(**query)
+            else:
+                qs = (super(ManyRelatedManager, self).get_query_set().using(db)
+                      ._next_is_sticky().filter(**query))
 
             # M2M: need to annotate the query in order to get the primary model
-            # that the secondary model was actually related to. We know that
-            # there will already be a join on the join table, so we can just add
-            # the select.
+            # that the secondary model was actually related to.
+
+            # We know that there will already be a join on the join table, so we
+            # can just add the select.
 
             # For non-autocreated 'through' models, can't assume we are
             # dealing with PK values.
+
+            # TODO: This is at the wrong level of abstraction. We should not
+            # be generating SQL here, but instead maybe pass this information
+            # to the connection. NoSQL camp will have problems with this, for
+            # example.
             fk = self.through._meta.get_field(self.source_field_name)
             source_col = fk.column
             join_table = self.through._meta.db_table
-            connection = connections[db]
+            if custom_qs is not None:
+                connection = connections[custom_qs.db]
+            else:
+                connection = connections[db]
+
             qn = connection.ops.quote_name
             qs = qs.extra(select={'_prefetch_related_val':
                                       '%s.%s' % (qn(join_table), qn(source_col))})
@@ -570,6 +611,12 @@ def create_many_related_manager(superclass, rel):
                     attrgetter(select_attname),
                     False,
                     self.prefetch_cache_name)
+
+        def all(self):
+            try:
+                return self.instance._prefetched_objects_cache[self.prefetch_cache_name]
+            except (AttributeError, KeyError):
+                return super(ManyRelatedManager, self).all()
 
         # If the ManyToMany relation has an intermediary model,
         # the add and remove methods do not exist.

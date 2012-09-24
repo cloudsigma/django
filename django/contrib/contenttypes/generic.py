@@ -62,7 +62,9 @@ class GenericForeignKey(object):
             # This should never happen. I love comments like this, don't you?
             raise Exception("Impossible arguments to GFK.get_content_type!")
 
-    def get_prefetch_query_set(self, instances):
+    def get_prefetch_query_set(self, instances, custom_qs=None):
+        if custom_qs is not None:
+            raise ValueError("Custom queryset can't be used for this lookup")
         # For efficiency, group the instances by content type and then do one
         # query per model
         fk_dict = defaultdict(set)
@@ -320,19 +322,33 @@ def create_generic_related_manager(superclass):
                 db = self._db or router.db_for_read(self.model, instance=self.instance)
                 return super(GenericRelatedObjectManager, self).get_query_set().using(db).filter(**self.core_filters)
 
-        def get_prefetch_query_set(self, instances):
-            db = self._db or router.db_for_read(self.model, instance=instances[0])
+        def get_prefetch_query_set(self, instances, custom_qs=None):
+            if not instances:
+                return self.model._default_manager.none()
             query = {
                 '%s__pk' % self.content_type_field_name: self.content_type.id,
                 '%s__in' % self.object_id_field_name:
                     set(obj._get_pk_val() for obj in instances)
-                }
-            qs = super(GenericRelatedObjectManager, self).get_query_set().using(db).filter(**query)
+            }
+            if custom_qs is not None:
+                qs = custom_qs.filter(**query)
+            else:
+                db = self._db or router.db_for_read(self.model, instance=instances[0])
+                qs = super(GenericRelatedObjectManager, self).get_query_set()\
+                         .using(db).filter(**query)
             return (qs,
                     attrgetter(self.object_id_field_name),
                     lambda obj: obj._get_pk_val(),
                     False,
                     self.prefetch_cache_name)
+
+
+        def all(self):
+            try:
+                return self.instance._prefetched_objects_cache[self.prefetch_cache_name]
+            except (AttributeError, KeyError):
+                return super(GenericRelatedObjectManager, self).all()
+
 
         def add(self, *objs):
             for obj in objs:
