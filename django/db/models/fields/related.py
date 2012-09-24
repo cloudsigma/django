@@ -328,17 +328,23 @@ class ReverseSingleRelatedObjectDescriptor(object):
             raise ValueError(
                 "Custom querysets can't be used for many-to-one relations")
 
-        vals = set(getattr(instance, self.field.attname) for instance in instances)
         other_field = self.field.rel.get_related_field()
+        rel_obj_attr = attrgetter(other_field.attname)
+        instance_attr = attrgetter(self.field.attname)
+        instances_dict = dict((instance_attr(inst), inst) for inst in instances)
         if other_field.rel:
-            params = {'%s__pk__in' % self.field.rel.field_name: vals}
+            params = {'%s__pk__in' % self.field.rel.field_name: list(instances_dict)}
         else:
-            params = {'%s__in' % self.field.rel.field_name: vals}
-        return (self.get_query_set(instance=instances[0]).filter(**params),
-                attrgetter(self.field.rel.field_name),
-                attrgetter(self.field.attname),
-                True,
-                self.cache_name)
+            params = {'%s__in' % self.field.rel.field_name: list(instances_dict)}
+        qs = self.get_query_set(instance=instances[0]).filter(**params)
+        # Since we're going to assign directly in the cache,
+        # we must manage the reverse relation cache manually.
+        if not self.field.rel.multiple:
+            rel_obj_cache_name = self.field.related.get_cache_name()
+            for rel_obj in qs:
+                instance = instances_dict[rel_obj_attr(rel_obj)]
+                setattr(rel_obj, rel_obj_cache_name, instance)
+        return qs, rel_obj_attr, instance_attr, True, self.cache_name
 
     def __get__(self, instance, instance_type=None):
         if instance is None:
