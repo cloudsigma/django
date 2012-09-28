@@ -97,9 +97,6 @@ class R(object):
     # Luckily the user does not need to know anything about this.
 
     def __init__(self, lookup, to_attr=None, qs=None):
-        if qs is not None and not to_attr:
-            raise ValueError('When custom qs is defined, to_attr '
-                             'must also be defined')
         self.lookup = lookup
         self.to_attr = to_attr
         self.qs = qs
